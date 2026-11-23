@@ -204,6 +204,50 @@ OtaPalStatus_t otaPal_Abort( AfrOtaJobDocumentFields_t * const pFileContext )
     return ota_ret;
 }
 
+/* Erasing the whole partition up front stalls the other core for tens of
+ * seconds and starves IDLE0 into the task watchdog on a busy network. Only the
+ * first sector is erased by esp_ota_begin; the rest is erased a sector at a
+ * time just before each block lands. Blocks arrive in order. */
+static uint32_t s_ota_erased_to = 0;
+
+static esp_err_t prvOtaEraseThrough( uint32_t end )
+{
+    const esp_partition_t * p = ota_ctx.update_partition;
+
+    if( p == NULL )
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if( end > p->size )
+    {
+        end = p->size;
+    }
+
+    while( s_ota_erased_to < end )
+    {
+        esp_err_t err = esp_partition_erase_range( p, s_ota_erased_to, p->erase_size );
+
+        if( err != ESP_OK )
+        {
+            return err;
+        }
+
+        s_ota_erased_to += p->erase_size;
+    }
+
+    return ESP_OK;
+}
+
+/* Wiping the image header is enough to keep a bad image from booting. */
+static void prvOtaInvalidate( const esp_partition_t * p )
+{
+    if( p != NULL )
+    {
+        esp_partition_erase_range( p, 0, p->erase_size );
+    }
+}
+
 /* Attempt to create a new receive file for the file chunks as they come in. */
 OtaPalStatus_t otaPal_CreateFileForRx( AfrOtaJobDocumentFields_t * const pFileContext )
 {
@@ -232,7 +276,7 @@ OtaPalStatus_t otaPal_CreateFileForRx( AfrOtaJobDocumentFields_t * const pFileCo
                update_partition->subtype, update_partition->address ) );
 
     esp_ota_handle_t update_handle;
-    esp_err_t err = esp_ota_begin( update_partition, OTA_SIZE_UNKNOWN, &update_handle );
+    esp_err_t err = esp_ota_begin( update_partition, update_partition->erase_size, &update_handle );
 
     if( err != ESP_OK )
     {
@@ -243,6 +287,7 @@ OtaPalStatus_t otaPal_CreateFileForRx( AfrOtaJobDocumentFields_t * const pFileCo
     ota_ctx.cur_ota = pFileContext;
     ota_ctx.update_partition = update_partition;
     ota_ctx.update_handle = update_handle;
+    s_ota_erased_to = update_partition->erase_size;
 
     ota_ctx.data_write_len = 0;
     ota_ctx.valid_image = false;
@@ -518,7 +563,7 @@ OtaPalStatus_t otaPal_CloseFile( AfrOtaJobDocumentFields_t * const pFileContext 
 
         if( mainErr != OtaPalSuccess )
         {
-            esp_partition_erase_range( ota_ctx.update_partition, 0, ota_ctx.update_partition->size );
+            prvOtaInvalidate( ota_ctx.update_partition );
         }
         else
         {
@@ -533,7 +578,12 @@ OtaPalStatus_t otaPal_CloseFile( AfrOtaJobDocumentFields_t * const pFileContext 
 
                 if( mainErr == OtaPalSuccess )
                 {
-                    esp_err_t ret = esp_ota_write_with_offset( ota_ctx.update_handle, sec_boot_sig, ECDSA_SIG_SIZE, ota_ctx.data_write_len );
+                    esp_err_t ret = prvOtaEraseThrough( ota_ctx.data_write_len + ECDSA_SIG_SIZE );
+
+                    if( ret == ESP_OK )
+                    {
+                        ret = esp_ota_write_with_offset( ota_ctx.update_handle, sec_boot_sig, ECDSA_SIG_SIZE, ota_ctx.data_write_len );
+                    }
 
                     if( ret != ESP_OK )
                     {
@@ -575,7 +625,7 @@ OtaPalStatus_t otaPal_ActivateNewImage( AfrOtaJobDocumentFields_t * const pFileC
         if( esp_ota_end( ota_ctx.update_handle ) != ESP_OK )
         {
             LogError( ( "esp_ota_end failed!" ) );
-            esp_partition_erase_range( ota_ctx.update_partition, 0, ota_ctx.update_partition->size );
+            prvOtaInvalidate( ota_ctx.update_partition );
             otaPal_ResetDevice( pFileContext );
         }
 
@@ -584,7 +634,7 @@ OtaPalStatus_t otaPal_ActivateNewImage( AfrOtaJobDocumentFields_t * const pFileC
         if( err != ESP_OK )
         {
             LogError( ( "esp_ota_set_boot_partition failed (%d)!", err ) );
-            esp_partition_erase_range( ota_ctx.update_partition, 0, ota_ctx.update_partition->size );
+            prvOtaInvalidate( ota_ctx.update_partition );
             _esp_ota_ctx_clear( &ota_ctx );
         }
 
@@ -604,7 +654,12 @@ int16_t otaPal_WriteBlock( AfrOtaJobDocumentFields_t * const pFileContext,
 {
     if( _esp_ota_ctx_validate( pFileContext ) )
     {
-        esp_err_t ret = esp_ota_write_with_offset( ota_ctx.update_handle, pacData, iBlockSize, iOffset );
+        esp_err_t ret = prvOtaEraseThrough( iOffset + iBlockSize );
+
+        if( ret == ESP_OK )
+        {
+            ret = esp_ota_write_with_offset( ota_ctx.update_handle, pacData, iBlockSize, iOffset );
+        }
 
         if( ret != ESP_OK )
         {
